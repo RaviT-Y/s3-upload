@@ -1,5 +1,6 @@
 """Tests for scripts/check_zips.py: only zips that hold nothing but txt/json/html files stay."""
 
+import json
 import os
 import struct
 import subprocess
@@ -41,7 +42,7 @@ GOOD = [("metadata.json", b'{"a": 1}', None), ("others.txt", b"[OK]x.h\n", None)
 CASES = {
     # name: (entries, expected reason or None for "valid")
     "valid": (GOOD, None),
-    "upper case extensions": ([("A.TXT", b"x", None), ("B.JSON", b"{}", None), ("C.Html", b"<p>", None)], None),
+    "upper case extensions": ([("A.TXT", b"x", None), ("metadata.json", b"{}", None), ("C.Html", b"<p>", None)], None),
     "log file": (GOOD + [("hdr/debug_output/logs/diagnostics.log", b"log\n", None)], "unexpected-file-type"),
     "script by name": (GOOD + [("run.sh", b"echo hi\n", None)], "unexpected-file-type"),
     "program by name": (GOOD + [("tool.exe", b"MZ....", None)], "unexpected-file-type"),
@@ -70,8 +71,9 @@ CASES = {
     # Folders are fine at any depth; every file down there must be valid too.
     "deep folders with valid files": (
         [("a/", b"", 0o40755), ("a/b/", b"", 0o40755), ("a/b/c/", b"", 0o40755), ("a/b/c/d/", b"", 0o40755),
-         ("a/b/c/d/e.json", b"{}", None), ("a/b/x.txt", b"x", None), ("a/empty/", b"", 0o40755)], None),
-    "deep file without folder entries": ([("a/b/c/d/e/f/g.html", b"<p>", None)], None),
+         ("a/b/c/d/e.json", b"{}", None), ("a/b/x.txt", b"x", None), ("a/empty/", b"", 0o40755),
+         ("metadata.json", b"{}", None)], None),
+    "deep file without folder entries": ([("a/b/c/d/e/f/g.html", b"<p>", None), ("metadata.json", b"{}", None)], None),
     "folder named like a script": (GOOD + [("tools.sh/", b"", 0o40755), ("tools.sh/out.txt", b"x", None)], None),
     "bad extension deep down": (GOOD + [("a/b/c/d/e/run.sh", b"echo", None)], "unexpected-file-type"),
     "no extension deep down": (GOOD + [("a/b/c/d/README", b"x", None)], "unexpected-file-type"),
@@ -90,18 +92,19 @@ class CheckZipsTest(unittest.TestCase):
         self.dir = os.path.join(self.tmp.name, "downloads")
         os.makedirs(self.dir)
 
-    def add(self, run_id, build, kind="api"):
+    def add(self, run_id, build, kind="api", created="2026-11-20T10:00:00Z"):
         folder = os.path.join(self.dir, "o__r__%s" % run_id)
         os.makedirs(folder)
         zip_path = os.path.join(folder, kind + ".zip")
         build(zip_path)
         with open(os.path.join(self.dir, "downloads.tsv"), "a") as handle:
-            handle.write("\t".join(["o/r", str(run_id), kind, "1", "2026-11-20T10:00:00Z", "a" * 40, zip_path]) + "\n")
+            handle.write("\t".join(["o/r", str(run_id), kind, "1", created, "a" * 40, zip_path]) + "\n")
         return zip_path
 
     def run_check(self, allowed=ALLOWED):
         open(os.path.join(self.dir, "skipped.tsv"), "a").close()
-        proc = subprocess.run([sys.executable, "-I", "-B", SCRIPT, self.dir, allowed], capture_output=True, text=True)
+        proc = subprocess.run([sys.executable, "-I", "-B", SCRIPT, self.dir, allowed], capture_output=True, text=True,
+                              env=dict(os.environ, S3_BUCKET="the-bucket"))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         with open(os.path.join(self.dir, "downloads.tsv")) as handle:
             kept = [line.split("\t")[1] for line in handle]
@@ -191,7 +194,66 @@ class CheckZipsTest(unittest.TestCase):
                 "sys.exit(check_zips.main(['check_zips', %r, %r]))" % (os.path.dirname(SCRIPT), self.dir, ALLOWED))
         proc = subprocess.run([sys.executable, "-I", "-B", "-c", code], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertEqual([line.split()[0] for line in proc.stdout.splitlines()], ["valid", "::warning::o/r", "Valid"])
+        # the short log: one line per zip, the summary, and the S3 paths (always printed)
+        self.assertEqual([line.split()[0] for line in proc.stdout.splitlines() if line.strip()],
+                         ["valid", "::warning::o/r", "Valid", "===", "api"])
+
+    def metadata_zip(self, metadata, kind="api", name=None):
+        data = metadata if isinstance(metadata, bytes) else json.dumps(metadata).encode()
+        return lambda path: make_zip(path, [(name or ("metadata.json" if kind == "api" else "abi_metadata.json"), data, None),
+                                            ("others.txt", b"x", None)])
+
+    def rows(self):
+        with open(os.path.join(self.dir, "downloads.tsv")) as handle:
+            return [line.rstrip("\n").split("\t") for line in handle]
+
+    def test_s3_path_is_added_to_every_valid_zip_and_logged_at_the_end(self):
+        self.add(1, self.metadata_zip({"ref_name": "42/merge"}), created="2026-11-23T10:06:25Z")
+        self.add(2, self.metadata_zip({"ref_name": "development"}, "abi"), kind="abi", created="2027-01-02T03:59:59Z")
+        kept, skipped, output = self.run_check()
+        self.assertEqual((kept, skipped), (["1", "2"], {}))
+        self.assertEqual([row[7] for row in self.rows()], [
+            "2026/11/23/10/github.com/o/r/42/merge/1", "2027/01/02/03/github.com/o/r/development/2"])
+        end = output[output.index("=== S3 paths"):]
+        self.assertIn("   api s3://the-bucket/2026/11/23/10/github.com/o/r/42/merge/1/files/", end)
+        self.assertIn("   abi s3://the-bucket/2027/01/02/03/github.com/o/r/development/2/files/", end)
+
+    def test_testing_default_ref_when_there_is_no_ref_name(self):
+        self.add(1, self.metadata_zip({"pr_number": 42}))
+        self.add(2, self.metadata_zip({"ref_name": None}))
+        kept, skipped, output = self.run_check()
+        self.assertEqual((kept, skipped), (["1", "2"], {}))
+        self.assertEqual([row[7] for row in self.rows()], ["2026/11/20/10/github.com/o/r/ref-name-missing/1",
+                                                           "2026/11/20/10/github.com/o/r/ref-name-missing/2"])
+        self.assertIn("no ref_name in metadata.json: using the testing default 'ref-name-missing'", output)
+
+    def test_zips_whose_s3_path_cannot_be_worked_out_are_skipped(self):
+        bad_refs = ["feature/x+y", "../x", "a/../b", "a..b", "a b", "/abs", "trailing/", "a//b", ".hidden", "x/.", "ünï",
+                    "a;b", "$(x)", "x\ny", "42/merge\n", "", 7, True, ["a"], {"a": 1}]
+        for number, ref in enumerate(bad_refs, start=1):
+            self.add(number, self.metadata_zip({"ref_name": ref}))
+        n = len(bad_refs)
+        self.add(n + 1, self.metadata_zip(b"this is not json"))
+        self.add(n + 2, self.metadata_zip(b"[1, 2]"))
+        self.add(n + 3, self.metadata_zip(b"\xff\xfe"))
+        self.add(n + 4, lambda path: make_zip(path, [("others.txt", b"x", None)]))                  # no metadata file
+        self.add(n + 5, self.metadata_zip({"ref_name": "x"}, name="abi_metadata.json"))             # api needs metadata.json
+        self.add(n + 6, self.metadata_zip({"ref_name": "x"}, kind="abi", name="metadata.json"), kind="abi")
+        self.add(n + 7, self.metadata_zip({"ref_name": "x"}), created="yesterday")
+        kept, skipped, output = self.run_check()
+        self.assertEqual(kept, [])
+        self.assertEqual({int(k): v for k, v in skipped.items()}, dict(
+            [(number, "invalid-ref") for number in range(1, n + 1)] +
+            [(n + 1, "invalid-metadata"), (n + 2, "invalid-metadata"), (n + 3, "invalid-metadata"),
+             (n + 4, "no-metadata"), (n + 5, "no-metadata"), (n + 6, "no-metadata"), (n + 7, "unexpected-data")]))
+        self.assertEqual(self.rows(), [])
+        for line in output.splitlines():
+            if line.startswith("::"):
+                self.assertTrue(line.startswith("::warning::"), line)
+
+    def test_huge_metadata_file_is_refused(self):
+        self.add(1, self.metadata_zip(b'{"ref_name": "x", "pad": "' + b"a" * 2_000_000 + b'"}'))
+        self.assertEqual(self.run_check()[:2], ([], {"1": "invalid-metadata"}))
 
     def test_empty_list(self):
         open(os.path.join(self.dir, "downloads.tsv"), "w").close()

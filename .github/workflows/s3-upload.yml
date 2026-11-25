@@ -1,30 +1,39 @@
-# ARMOR S3 upload: skeleton.
+# ARMOR S3 upload.
 #
 # One job on the AWS runner. The steps share the machine, so files pass from step to step in work/:
-#   1. download   downloads the ARMOR artifacts created in the lookback window (30 hours)   (implemented)
-#   2. validate   keeps only the zips that hold nothing but .txt, .json, .html and .log files   (implemented)
-#   3. prepare    PLACEHOLDER: check the runs, unpack the valid zips, work out the S3 paths
-#   4. upload     the real part: plain `aws s3 cp` of what was prepared
+#   1. download   downloads the ARMOR artifacts created in the lookback window (30 hours)
+#   2. validate   keeps only the zips that hold nothing but .txt, .json, .html and .log files, and works out
+#                 the S3 path of each (from the zip's own metadata). It logs all paths at its end.
+#   3. prepare    asks GitHub about each run, checks the metadata against it and unpacks the files to upload
+#                 (no AWS here)
+#   4. upload     plain `aws s3 cp`; an artifact that is already in S3 is left alone
+#   5. finish     fails the run if any artifact was skipped, so a skipped artifact is never missed
 #
-# Every step runs where the runner's instance role (the S3 access) is reachable, so the download and
-# validate steps must treat the zips as untrusted. The runner needs the `gh` CLI, `jq` and `python3`.
+# Every step runs where the runner's instance role (the S3 access) is reachable, so the download, validate and
+# prepare steps must treat the zips as untrusted. The runner needs the `gh` CLI, `jq` and `python3`, and the
+# role needs s3:PutObject and s3:ListBucket (to see what is already uploaded) on the bucket.
 #
-# What the download step leaves behind (work/downloads):
+# Work folder (work/):
 #
-#   downloads.tsv   one line per downloaded zip:  repo <TAB> run_id <TAB> kind <TAB> artifact_id <TAB> created_at <TAB> head_sha <TAB> zip
-#                   (after the validate step: only the valid zips)
-#   skipped.tsv     one line per artifact that was not downloaded or failed validation:  repo <TAB> run_id <TAB> kind <TAB> reason
-#   <owner>__<repo>__<run_id>/<kind>.zip   the untrusted zips (kind: api | abi)
-#
-# What the prepare step has to leave behind:
-#
-#   work/verified/to_upload.tsv   one line per verified artifact:   <kind> <TAB> <folder> <TAB> <s3-prefix>
+#   downloads/downloads.tsv   one line per downloaded zip:  repo <TAB> run_id <TAB> kind <TAB> artifact_id <TAB> created_at <TAB> head_sha <TAB> zip
+#                             (after the validate step: only the valid zips, with the S3 path added as a last column: s3_prefix)
+#   downloads/skipped.tsv     one line per artifact that was not uploaded because something was wrong:
+#                             repo <TAB> run_id <TAB> kind <TAB> reason          (every step adds to it)
+#   downloads/<owner>__<repo>__<run_id>/<kind>.zip   the untrusted zips (kind: api | abi)
+#   verified/to_upload.tsv    what the prepare step hands to the upload step, one line per artifact:
+#                             kind <TAB> folder <TAB> s3-prefix
 #       kind       api | abi
-#       folder     where the verified files are, relative to work/verified
-#                  (api: the report folder, abi: a folder holding abi_metadata.json)
-#       s3-prefix  e.g. 2026/11/20/10/github.com/<owner>/<repo>/<pr>/merge/<run_id>
-#                  Build it from GitHub run information only, never from artifact content.
-#   work/verified/<folder>/...    the verified files
+#       folder     where the files to upload are, relative to work/verified
+#       s3-prefix  <yyyy>/<mm>/<dd>/<hh>/github.com/<owner>/<repo>/<ref>/<run_id>
+#                  time = when GitHub created the artifact; repo, run_id = GitHub's own data;
+#                  ref = "ref_name" from the artifact's metadata (the github.ref_name of the PR job: <pr>/merge for a
+#                  pull request, the branch name for a push), checked against the run as far as GitHub can tell
+#                  and allowed to be plain folder names only. Files go to s3://<bucket>/<s3-prefix>/files/...
+#   verified/<folder>/...     the files to upload: api = everything but debug_output, abi = abi_metadata.json only
+#
+# What the ARMOR checks must write: metadata.json (api) and abi_metadata.json (abi) both need
+#   project_url, github_event, pr_number (null when not a pull request) and ref_name (= github.ref_name).
+#   (TESTING: until they write ref_name, the validate step uses the folder name "ref-name-missing" instead.)
 #
 # Example line:
 #   api<TAB>qualcomm__fastrpc__123/api<TAB>2026/11/20/10/github.com/qualcomm/fastrpc/42/merge/123
@@ -77,7 +86,8 @@ jobs:
           GH_TOKEN: ${{ secrets.ARMOR_READ_TOKEN || github.token }}
           LOOKBACK_HOURS: ${{ inputs.lookback-hours || '30' }}
         run: |
-          set -uo pipefail
+          set +e -uo pipefail     # the runner starts bash with -e: every failure is handled below instead
+          export LC_ALL=C          # [A-Za-z0-9] in the checks below must mean plain ASCII, whatever the runner's locale
           verbose=1        # testing: print every detail. Set to 0 for a short log.
           # The run is daily, so the window is longer than 24 hours: a late or skipped schedule must not
           # leave a gap. The overlap means an artifact can show up in two runs (see the verify step).
@@ -213,41 +223,186 @@ jobs:
           fi
 
       # Keeps only the zips that hold nothing but plain data files. Every other zip is deleted and
-      # recorded in work/downloads/skipped.tsv; downloads.tsv then lists the valid zips only.
-      - name: Validate zips (only txt, json, html and log files)
+      # recorded in work/downloads/skipped.tsv; downloads.tsv then lists the valid zips only, each with the
+      # S3 path it will get. The paths are logged at the end of this step.
+      - name: Validate zips (only txt, json, html and log files) and work out the S3 paths
         env:
           ALLOWED_EXT: "txt json html log"
         run: python3 -I -B scripts/check_zips.py work/downloads "$ALLOWED_EXT"
 
-      # - name: Prepare upload (placeholder)
-      #   run: |
-      #     # TODO: for every zip in work/downloads/downloads.tsv: check the run (finished, an ARMOR run, not
-      #     # uploaded before: the lookback window overlaps the previous run's by about 6 hours, so the same
-      #     # run can arrive twice) and the metadata against the run. Unpack what passed under
-      #     # work/verified/<folder>/ and add one line per artifact to work/verified/to_upload.tsv. Fail the
-      #     # run in a last step if anything is in work/downloads/skipped.tsv.
-      #     mkdir -p work/verified
-      #     printf '# kind\tfolder\ts3-prefix\n' > work/verified/to_upload.tsv
+      # For every valid zip: asks GitHub about the run, checks the zip's metadata against it, unpacks the files
+      # that will be uploaded and works out their S3 path. Nothing here uses AWS.
+      - name: Prepare upload (check the runs, unpack, build the S3 paths)
+        env:
+          GH_TOKEN: ${{ secrets.ARMOR_READ_TOKEN || github.token }}
+        run: |
+          set +e -uo pipefail     # the runner starts bash with -e: every failure is handled below instead
+          export LC_ALL=C          # [A-Za-z0-9] in the checks below must mean plain ASCII, whatever the runner's locale
+          verbose=1        # testing: print every detail. Set to 0 for a short log.
+          down=work/downloads
+          ver=work/verified
+          mkdir -p "$ver"
+          : > "$ver/to_upload.tsv"
+          ready=0
+          waiting=0
 
-      # - name: Upload to S3
-      #   run: |
-      #     set -uo pipefail
-      #     failed=0
-      #     while IFS=$'\t' read -r kind folder prefix; do
-      #       [[ -z $kind || $kind == \#* ]] && continue
-      #       # Keep these plain relative paths: they must never point outside work/verified.
-      #       if ! [[ $folder =~ ^[A-Za-z0-9._/-]+$ && $prefix =~ ^[A-Za-z0-9._/-]+$ && $folder != *..* && $prefix != *..* ]]; then
-      #         echo "::error::unsafe folder or prefix in to_upload.tsv"
-      #         failed=1
-      #         continue
-      #       fi
-      #       src="work/verified/$folder"
-      #       case $kind in
-      #         api) aws s3 cp "$src" "s3://$S3_BUCKET/$prefix/files" --recursive \
-      #                --content-type application/octet-stream --only-show-errors ;;
-      #         abi) aws s3 cp "$src/abi_metadata.json" "s3://$S3_BUCKET/$prefix/files/abi_metadata.json" \
-      #                --content-type application/json --only-show-errors ;;
-      #         *)   echo "::error::unknown kind in to_upload.tsv"; false ;;
-      #       esac < /dev/null || { echo "::error::upload failed for $folder"; failed=1; }
-      #     done < work/verified/to_upload.tsv
-      #     exit "$failed"
+          # skip <repo> <run_id> <kind> <reason>
+          skip() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$down/skipped.tsv"; echo "::warning::$1 run $2 $3 skipped ($4)"; }
+
+          while IFS=$'\t' read -r repo run_id kind art_id created head_sha zip prefix; do
+            echo "== $repo run $run_id $kind"
+            echo "   s3 path (worked out by the validate step): $prefix"
+
+            # 1. What GitHub says about the run. This is what is trusted, not what the zip says about itself.
+            if ! run="$(gh api "/repos/$repo/actions/runs/$run_id" < /dev/null)" \
+               || ! info="$(jq -r '[(.status // "-"), (.event // "-"), (.pull_requests[0].number // "-"), (.head_branch // "-")] | @tsv' <<< "$run")"; then
+              skip "$repo" "$run_id" "$kind" run-lookup-failed
+              continue
+            fi
+            IFS=$'\t' read -r status event pr head_branch <<< "$info"
+            echo "   run: status=$status event=$event pull-request=$pr branch=$head_branch"
+
+            # A run that is still going is not an error: the next daily run finds its artifact again.
+            if [[ $status != completed ]]; then
+              echo "   the run is not finished yet ($status): a later run of this workflow picks it up"
+              waiting=$((waiting + 1))
+              continue
+            fi
+            # 2. Unpack only what will be uploaded.
+            folder="${repo//\//__}__$run_id/$kind"
+            if ! python3 -I -B scripts/unpack_zip.py "$kind" "$zip" "$ver/$folder" "$verbose" < /dev/null; then
+              rm -rf "$ver/$folder"
+              skip "$repo" "$run_id" "$kind" unpack-failed
+              continue
+            fi
+
+            # 3. The zip's metadata must agree with what GitHub says about the run. ref_name is part of the S3
+            # path (the validate step checked it is plain folder names): what the PR job saw as github.ref_name,
+            # <pr>/merge for a pull request, the branch name for a push. GitHub confirms it as far as it can: a
+            # push, dispatch or schedule run ran on exactly that branch, and a pull request run knows its number
+            # (not for fork PRs, where GitHub leaves the list empty: there only the form <number>/merge is checked).
+            meta="$ver/$folder/metadata.json"
+            [[ $kind == abi ]] && meta="$ver/$folder/abi_metadata.json"
+            pr_json=null
+            [[ $pr =~ ^[0-9]+$ ]] && pr_json=$pr
+            if ! mismatch="$(jq -r --arg url "https://github.com/$repo" --arg event "$event" --argjson pr "$pr_json" --arg branch "$head_branch" '
+                  def ref_ok:
+                    .ref_name == null                                  # TESTING: no ref_name yet, the validate step used its default
+                    or ((.ref_name | type) == "string"
+                        and (if $event == "pull_request" then
+                               (.ref_name | test("^[0-9]+/merge$")) and ($pr == null or .ref_name == "\($pr)/merge")
+                             elif $event == "pull_request_target" then true
+                             else .ref_name == $branch end));
+                  [(if .project_url == $url then empty else "project_url" end),
+                   (if .github_event == $event then empty else "github_event" end),
+                   (if $pr == null or .pr_number == $pr then empty else "pr_number" end),
+                   (if ref_ok then empty else "ref_name" end)] | join(",")' "$meta" 2> /dev/null)"; then
+              rm -rf "$ver/$folder"
+              skip "$repo" "$run_id" "$kind" invalid-metadata
+              continue
+            fi
+            if [[ -n $mismatch ]]; then
+              echo "   the metadata does not match the run in: $mismatch"
+              rm -rf "$ver/$folder"
+              skip "$repo" "$run_id" "$kind" metadata-mismatch
+              continue
+            fi
+
+            printf '%s\t%s\t%s\n' "$kind" "$folder" "$prefix" >> "$ver/to_upload.tsv"
+            ready=$((ready + 1))
+            echo "   ready to upload: $folder"
+          done < "$down/downloads.tsv"
+
+          echo "Ready to upload: $ready, run not finished yet: $waiting, skipped so far: $(wc -l < "$down/skipped.tsv")"
+          if (( verbose )); then
+            echo
+            echo "=== skipped.tsv: repo, run_id, kind, reason"
+            cat "$down/skipped.tsv"
+          fi
+
+          # What the upload step will write, file by file. Nothing is uploaded here.
+          echo
+          echo "=== S3 destinations: s3://$S3_BUCKET/<s3-prefix>/files/<file>"
+          while IFS=$'\t' read -r kind folder prefix; do
+            [[ -z $kind ]] && continue
+            echo "-- $kind ($folder)"
+            find "$ver/$folder" -type f -printf '%P\t%s\n' | sort | while IFS=$'\t' read -r name size; do
+              printf '   s3://%s/%s/files/%s   (%s bytes)\n' "$S3_BUCKET" "$prefix" "$name" "$size"
+            done
+          done < "$ver/to_upload.tsv"
+
+      # The same artifact always gets the same S3 path, so S3 itself tells whether it was uploaded before:
+      # no ledger. metadata.json is uploaded last and is what is looked for, so an interrupted upload is
+      # repeated by the next run. Only here is AWS used.
+      - name: Upload to S3
+        run: |
+          set +e -uo pipefail     # the runner starts bash with -e: every failure is handled below instead
+          export LC_ALL=C          # [A-Za-z0-9] in the checks below must mean plain ASCII, whatever the runner's locale
+          failed=0
+          uploaded=0
+          already=0
+          while IFS=$'\t' read -r kind folder prefix; do
+            [[ -z $kind || $kind == \#* ]] && continue
+            # Keep these plain relative paths: they must never point outside work/verified.
+            if ! [[ $folder =~ ^[A-Za-z0-9._/-]+$ && $prefix =~ ^[A-Za-z0-9._/-]+$ && $folder != *..* && $prefix != *..* ]]; then
+              echo "::error::unsafe folder or prefix in to_upload.tsv"
+              failed=1
+              continue
+            fi
+            case $kind in
+              api) marker=metadata.json ;;
+              abi) marker=abi_metadata.json ;;
+              *)   echo "::error::unknown kind in to_upload.tsv"; failed=1; continue ;;
+            esac
+            src="work/verified/$folder"
+            dest="s3://$S3_BUCKET/$prefix/files"
+
+            # `aws s3 ls` exits 0 when the file is there, 1 with no output when it is not, anything else is an error.
+            found="$(aws s3 ls "$dest/$marker" < /dev/null 2>&1)"
+            rc=$?
+            if (( rc == 0 )); then
+              echo "already uploaded, left alone: $dest"
+              already=$((already + 1))
+              continue
+            fi
+            if (( rc != 1 )) || [[ -n $found ]]; then
+              echo "::error::cannot check S3 for $dest: ${found//$'\n'/ }"
+              failed=1
+              continue
+            fi
+
+            echo "uploading $folder to $dest"
+            if [[ $kind == api ]]; then
+              aws s3 cp "$src" "$dest" --recursive --exclude metadata.json \
+                  --content-type application/octet-stream --only-show-errors < /dev/null \
+                && aws s3 cp "$src/metadata.json" "$dest/metadata.json" \
+                  --content-type application/octet-stream --only-show-errors < /dev/null
+            else
+              aws s3 cp "$src/abi_metadata.json" "$dest/abi_metadata.json" \
+                  --content-type application/json --only-show-errors < /dev/null
+            fi
+            if (( $? == 0 )); then
+              uploaded=$((uploaded + 1))
+            else
+              echo "::error::upload failed for $folder"
+              failed=1
+            fi
+          done < work/verified/to_upload.tsv
+          echo "Uploaded: $uploaded, already uploaded: $already"
+          exit "$failed"
+
+      # Last step. Skipped artifacts do not stop the others from being uploaded, but they must not go unnoticed.
+      - name: Fail the run if any artifact was skipped
+        if: ${{ !cancelled() }}
+        run: |
+          skipped=work/downloads/skipped.tsv
+          if [[ ! -f $skipped ]]; then
+            echo "::error::no skipped.tsv: an earlier step did not finish"
+            exit 1
+          fi
+          if [[ -s $skipped ]]; then
+            echo "::error::$(wc -l < "$skipped") artifact(s) were skipped and not uploaded (repo, run, kind, reason):"
+            sed 's/^/   /' "$skipped" | cat -v
+            exit 1
+          fi
+          echo "Nothing was skipped."

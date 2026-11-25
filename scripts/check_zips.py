@@ -4,11 +4,11 @@
 usage: check_zips.py <downloads-dir> "<allowed extensions>"      e.g.  check_zips.py work/downloads "txt json html log"
 
 Reads <downloads-dir>/downloads.tsv   (repo, run_id, kind, artifact_id, created_at, head_sha, zip):
-  - a zip that passes stays in downloads.tsv
+  - a zip that passes stays in downloads.tsv, with its S3 folder added as an 8th column (s3_prefix)
   - a zip that fails is deleted and recorded in skipped.tsv   (repo, run_id, kind, reason)
 
 A zip fails when it
-  - is not a readable zip, is empty, has too many entries or an encrypted entry
+  - is not a readable zip, is empty, has too many entries, would unpack to more than 1 GiB or has an encrypted entry
   - has a file name that is absolute, contains "..", a backslash or a control character
   - contains anything but regular files and empty folders (symlinks, devices, a folder holding data),
     or a file with an execute permission
@@ -16,12 +16,21 @@ A zip fails when it
   - contains a file that has an allowed name but is really a program, script or archive (first bytes)
 Folders may be nested as deep as you like: every file down there is checked the same way.
 
+The S3 folder of a zip that passed:  <yyyy>/<mm>/<dd>/<hh>/github.com/<repo>/<ref>/<run_id>
+  yyyy/mm/dd/hh   when GitHub created the artifact (created_at)
+  ref             "ref_name" in the zip's metadata.json (api) or abi_metadata.json (abi): the old github.ref_name,
+                  <pr>/merge for a pull request, the branch name for a push. Plain folder names only.
+A zip without a readable metadata file, or with a ref_name that is not plain folder names, fails too.
+The full list of S3 paths is printed at the end (the bucket name is read from the environment variable S3_BUCKET).
+
 Nothing is extracted: only the zip's directory and the first bytes of each file are read.
 Run it as `python3 -I -B`.
 """
 
 import collections
+import json
 import os
+import re
 import stat
 import sys
 import zipfile
@@ -29,8 +38,19 @@ import zipfile
 VERBOSE = True      # testing: print every detail (every entry of every zip). Set to False for a short log.
 
 MAX_ENTRIES = 5000
+MAX_UNPACKED_BYTES = 1024 ** 3     # all files together, as the zip declares them (a zip can be tiny and huge once unpacked)
 SNIFF_BYTES = 4096
 PREVIEW_BYTES = 24  # verbose log: how many of the first bytes of each file are shown
+MAX_METADATA_BYTES = 1024 * 1024
+
+METADATA_FILE = {"api": "metadata.json", "abi": "abi_metadata.json"}
+# TESTING ONLY: the <ref> folder when the metadata has no ref_name (the ARMOR checks do not write it yet).
+# Remove it before go-live: then a missing ref_name fails the zip like any other bad ref_name.
+DEFAULT_REF = "ref-name-missing"
+
+CREATED = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):")
+REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+REF_FOLDERS = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]*(/[A-Za-z0-9_-][A-Za-z0-9._-]*)*")   # ASCII only, no "." or ".." folders
 
 # First bytes of programs, scripts and archives.
 SIGNATURES = (
@@ -78,6 +98,10 @@ def check(zip_path, allowed, log=lambda text: None):
         if len(infos) > MAX_ENTRIES:
             log("      more than the %d entries allowed" % MAX_ENTRIES)
             return "too-many-files", str(len(infos))
+        total = sum(info.file_size for info in infos)
+        if total > MAX_UNPACKED_BYTES:
+            log("      %d bytes when unpacked, more than the %d allowed" % (total, MAX_UNPACKED_BYTES))
+            return "too-large-unpacked", str(total)
 
         def reject(number, reason, shown):
             log("      %4d REJECTED  %s   %s" % (number, reason, shown))
@@ -131,6 +155,35 @@ def check(zip_path, allowed, log=lambda text: None):
     return None
 
 
+def s3_prefix(zip_path, repo, run_id, kind, created, log=lambda text: None):
+    """The S3 folder of a zip that passed check(): (prefix, None), or (None, reason) when it cannot be worked out."""
+    when = CREATED.match(created)
+    if not (when and REPO.fullmatch(repo) and re.fullmatch("[0-9]+", run_id) and kind in METADATA_FILE):
+        return None, "unexpected-data"
+    name = METADATA_FILE[kind]
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            info = archive.getinfo(name)
+            if info.file_size > MAX_METADATA_BYTES:
+                return None, "invalid-metadata"
+            with archive.open(info) as handle:
+                metadata = json.loads(handle.read(MAX_METADATA_BYTES).decode("utf-8"))
+    except KeyError:
+        log("      %s is not in the zip" % name)
+        return None, "no-metadata"
+    except Exception:                                    # not UTF-8, not JSON, too deeply nested, ...
+        return None, "invalid-metadata"
+    if not isinstance(metadata, dict):
+        return None, "invalid-metadata"
+    ref = metadata.get("ref_name")
+    if ref is None:
+        ref = DEFAULT_REF
+        log("   no ref_name in %s: using the testing default %r" % (name, ref))
+    if not (isinstance(ref, str) and REF_FOLDERS.fullmatch(ref) and ".." not in ref):
+        return None, "invalid-ref"
+    return "%s/github.com/%s/%s/%s" % ("/".join(when.groups()), repo, ref, run_id), None
+
+
 def count_files(zip_path):
     counts = collections.Counter()
     with zipfile.ZipFile(zip_path) as archive:
@@ -171,9 +224,15 @@ def main(argv):
         log("   artifact %s, created %s, commit %s" % (clean(row[3]), clean(row[4]), clean(row[5])[:12]))
         log("   zip %s, %s" % (clean(zip_path), size))
         verdict = check(zip_path, allowed, log)
+        prefix = None
         if verdict is None:
-            kept.append(row)
+            prefix, reason = s3_prefix(zip_path, row[0], row[1], row[2], row[4], log)
+            if prefix is None:
+                verdict = (reason, "")
+        if verdict is None:
+            kept.append(row + [prefix])
             print("   valid    %s run %s %s: %s" % (repo, run_id, kind, count_files(zip_path)))
+            log("   s3 path: %s" % prefix)
             continue
         reason, entry = verdict
         reasons[reason] += 1
@@ -192,10 +251,17 @@ def main(argv):
     print("Valid zips: %d, skipped: %d (allowed file types: %s)" % (
         len(kept), len(rows) - len(kept), ", ".join(sorted(allowed))))
 
+    # The S3 folder of every valid zip. The next step checks the metadata against GitHub before anything is uploaded.
+    bucket = clean(os.environ.get("S3_BUCKET", "<bucket>"))
+    print()
+    print("=== S3 paths: the unzipped files of each valid zip go to s3://%s/<s3-prefix>/files/ (the zip itself is not uploaded)" % bucket)
+    for row in kept:
+        print("   %-3s s3://%s/%s/files/" % (clean(row[2]), bucket, row[7]))
+
     if VERBOSE:
         for reason, count in sorted(reasons.items()):
             log("   skipped because of %s: %d" % (reason, count))
-        for title, path in (("downloads.tsv (the valid zips: repo, run_id, kind, artifact_id, created_at, head_sha, zip)", downloads),
+        for title, path in (("downloads.tsv (the valid zips: repo, run_id, kind, artifact_id, created_at, head_sha, zip, s3_prefix)", downloads),
                             ("skipped.tsv (everything skipped in this run so far: repo, run_id, kind, reason)", skipped)):
             log("")
             log("=== " + title)
