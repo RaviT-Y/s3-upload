@@ -2,19 +2,21 @@
 #
 # One job on the AWS runner. The steps share the machine, so files pass from step to step in work/:
 #   1. download   downloads the ARMOR artifacts created in the lookback window (30 hours)   (implemented)
-#   2. verify     PLACEHOLDER: verify them and leave the result in work/verified
-#   3. upload     the real part: plain `aws s3 cp` of what was verified
+#   2. validate   keeps only the zips that hold nothing but .txt, .json, .html and .log files   (implemented)
+#   3. prepare    PLACEHOLDER: check the runs, unpack the valid zips, work out the S3 paths
+#   4. upload     the real part: plain `aws s3 cp` of what was prepared
 #
 # Every step runs where the runner's instance role (the S3 access) is reachable, so the download and
-# verify steps must treat the zips as untrusted. The runner needs the `gh` CLI and `jq`.
+# validate steps must treat the zips as untrusted. The runner needs the `gh` CLI, `jq` and `python3`.
 #
 # What the download step leaves behind (work/downloads):
 #
 #   downloads.tsv   one line per downloaded zip:  repo <TAB> run_id <TAB> kind <TAB> artifact_id <TAB> created_at <TAB> head_sha <TAB> zip
-#   skipped.tsv     one line per artifact that could not be downloaded:  repo <TAB> run_id <TAB> kind <TAB> reason
+#                   (after the validate step: only the valid zips)
+#   skipped.tsv     one line per artifact that was not downloaded or failed validation:  repo <TAB> run_id <TAB> kind <TAB> reason
 #   <owner>__<repo>__<run_id>/<kind>.zip   the untrusted zips (kind: api | abi)
 #
-# What the verify step has to leave behind:
+# What the prepare step has to leave behind:
 #
 #   work/verified/to_upload.tsv   one line per verified artifact:   <kind> <TAB> <folder> <TAB> <s3-prefix>
 #       kind       api | abi
@@ -210,18 +212,22 @@ jobs:
             find "$out" -type f -printf '   %8s bytes  %p\n'
           fi
 
-      # - name: Verify artifacts (placeholder)
+      # Keeps only the zips that hold nothing but plain data files. Every other zip is deleted and
+      # recorded in work/downloads/skipped.tsv; downloads.tsv then lists the valid zips only.
+      - name: Validate zips (only txt, json, html and log files)
+        env:
+          ALLOWED_EXT: "txt json html log"
+        run: python3 -I -B scripts/check_zips.py work/downloads "$ALLOWED_EXT"
+
+      # - name: Prepare upload (placeholder)
       #   run: |
       #     # TODO: for every zip in work/downloads/downloads.tsv: check the run (finished, an ARMOR run, not
       #     # uploaded before: the lookback window overlaps the previous run's by about 6 hours, so the same
-      #     # run can arrive twice) and the zip (file types, executables, symlinks, unsafe paths, sizes, JSON,
-      #     # metadata against the run). Ignore an artifact that fails and carry on with the next one; fail
-      #     # the run in a last step if any artifact was ignored or skipped (work/downloads/skipped.tsv).
-      #     # Put what passed under work/verified/<folder>/ and add one line per artifact to
-      #     # work/verified/to_upload.tsv.
+      #     # run can arrive twice) and the metadata against the run. Unpack what passed under
+      #     # work/verified/<folder>/ and add one line per artifact to work/verified/to_upload.tsv. Fail the
+      #     # run in a last step if anything is in work/downloads/skipped.tsv.
       #     mkdir -p work/verified
       #     printf '# kind\tfolder\ts3-prefix\n' > work/verified/to_upload.tsv
-      #     echo "TODO: verify the artifacts"
 
       # - name: Upload to S3
       #   run: |
