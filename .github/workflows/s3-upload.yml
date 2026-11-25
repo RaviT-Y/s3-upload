@@ -1,0 +1,188 @@
+# ARMOR S3 upload: skeleton.
+#
+# One job on the AWS runner. The steps share the machine, so files pass from step to step in work/:
+#   1. download   downloads the ARMOR artifacts created in the lookback window (30 hours)   (implemented)
+#   2. verify     PLACEHOLDER: verify them and leave the result in work/verified
+#   3. upload     the real part: plain `aws s3 cp` of what was verified
+#
+# Every step runs where the runner's instance role (the S3 access) is reachable, so the download and
+# verify steps must treat the zips as untrusted. The runner needs the `gh` CLI and `jq`.
+#
+# What the download step leaves behind (work/downloads):
+#
+#   downloads.tsv   one line per downloaded zip:  repo <TAB> run_id <TAB> kind <TAB> artifact_id <TAB> created_at <TAB> head_sha <TAB> zip
+#   skipped.tsv     one line per artifact that could not be downloaded:  repo <TAB> run_id <TAB> kind <TAB> reason
+#   <owner>__<repo>__<run_id>/<kind>.zip   the untrusted zips (kind: api | abi)
+#
+# What the verify step has to leave behind:
+#
+#   work/verified/to_upload.tsv   one line per verified artifact:   <kind> <TAB> <folder> <TAB> <s3-prefix>
+#       kind       api | abi
+#       folder     where the verified files are, relative to work/verified
+#                  (api: the report folder, abi: a folder holding abi_metadata.json)
+#       s3-prefix  e.g. 2026/11/20/10/github.com/<owner>/<repo>/<pr>/merge/<run_id>
+#                  Build it from GitHub run information only, never from artifact content.
+#   work/verified/<folder>/...    the verified files
+#
+# Example line:
+#   api<TAB>qualcomm__fastrpc__123/api<TAB>2026/11/20/10/github.com/qualcomm/fastrpc/42/merge/123
+
+name: ARMOR S3 Upload
+
+on:
+  schedule:
+    - cron: "17 3 * * *"          # once a day, 03:17 UTC
+  workflow_dispatch:
+    inputs:
+      lookback-hours:
+        description: "Hours to look back for ARMOR artifacts. Default 30 = the daily gap plus 6 hours for a late run. Raise it to catch up after a missed day (max 2160)."
+        required: false
+        default: "30"
+
+permissions: {}
+
+concurrency:
+  group: s3-upload
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Download, verify and upload
+    # Only the default branch may run this workflow: the job holds the S3 access.
+    if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    # AWS self-hosted runner: its instance role provides the S3 access.
+    runs-on: [self-hosted, ubuntu-latest]
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
+    env:
+      S3_BUCKET: qli-prd-armor-gh-artifacts
+      REPO_OWNER: qualcomm            # the owner of the repos listed in repos.txt
+    steps:
+      - name: Checkout (for repos.txt)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Self-hosted runners keep their folders between runs: never reuse an old work folder.
+      - name: Start with an empty work folder
+        run: rm -rf work
+
+      - name: Download ARMOR artifacts
+        env:
+          # The workflow's own token is tried first; set the secret ARMOR_READ_TOKEN only if it cannot
+          # read the other repos' artifacts.
+          GH_TOKEN: ${{ secrets.ARMOR_READ_TOKEN || github.token }}
+          LOOKBACK_HOURS: ${{ inputs.lookback-hours || '30' }}
+        run: |
+          set -uo pipefail
+          # The run is daily, so the window is longer than 24 hours: a late or skipped schedule must not
+          # leave a gap. The overlap means an artifact can show up in two runs (see the verify step).
+          lookback_hours="${LOOKBACK_HOURS:-30}"
+          if ! [[ $lookback_hours =~ ^[0-9]{1,4}$ ]] || (( lookback_hours < 1 || lookback_hours > 2160 )); then
+            echo "::error::lookback-hours must be a number between 1 and 2160"
+            exit 1
+          fi
+          max_zip=$((100 * 1024 * 1024))
+          cutoff="$(date -u -d "$lookback_hours hours ago" +%Y-%m-%dT%H:%M:%SZ)"
+          out=work/downloads
+          mkdir -p "$out"
+          : > "$out/downloads.tsv"
+          : > "$out/skipped.tsv"
+          list="$(mktemp)"
+
+          # skip <repo> <run_id> <kind> <reason>
+          skip() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$out/skipped.tsv"; echo "::warning::$1 run $2 $3 skipped ($4)"; }
+
+          mapfile -t repos < <(sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' repos.txt | grep -v '^$')
+          if (( ${#repos[@]} == 0 )); then
+            echo "::error::repos.txt lists no repositories"
+            exit 1
+          fi
+
+          for entry in "${repos[@]}"; do
+            # repos.txt lists bare repo names, owned by REPO_OWNER. An owner/repo line is accepted too.
+            repo="$entry"
+            [[ $repo == */* ]] || repo="$REPO_OWNER/$repo"
+            echo "== $repo"
+            if ! [[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ && ${repo#*/} != . && ${repo#*/} != .. ]]; then
+              skip "$entry" - - invalid-repo-name
+              continue
+            fi
+            for name in apichecker-reports abichecker-reports; do
+              kind="${name%checker-reports}"                    # api / abi
+
+              # List: gh api "/repos/<repo>/actions/artifacts?name=<name>"
+              # Keep what is not expired and was created inside the lookback window, newest artifact per run.
+              if ! gh api --paginate "/repos/$repo/actions/artifacts?name=$name&per_page=100" \
+                   | jq -r --arg name "$name" --arg cutoff "$cutoff" '
+                       .artifacts[]
+                       | select(.name == $name and (.expired | not) and .created_at >= $cutoff)
+                       | [.workflow_run.id, .id, .created_at, (.workflow_run.head_sha // "-"), .size_in_bytes] | @tsv' \
+                   | sort -t $'\t' -k1,1n -k3,3r | awk -F '\t' '!seen[$1]++' > "$list"; then
+                skip "$repo" - "$kind" listing-failed
+                continue
+              fi
+
+              while IFS=$'\t' read -r run_id art_id created head_sha size; do
+                if ! [[ $run_id =~ ^[0-9]+$ && $art_id =~ ^[0-9]+$ && $size =~ ^[0-9]+$ ]]; then
+                  skip "$repo" "$run_id" "$kind" unexpected-data
+                  continue
+                fi
+                if (( size > max_zip )); then
+                  skip "$repo" "$run_id" "$kind" too-large
+                  continue
+                fi
+
+                # Download: gh api "/repos/<repo>/actions/artifacts/<id>/zip" > <kind>.zip
+                zip="$out/${repo//\//__}__$run_id/$kind.zip"
+                mkdir -p "$(dirname "$zip")"
+                if gh api "/repos/$repo/actions/artifacts/$art_id/zip" < /dev/null > "$zip"; then
+                  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$repo" "$run_id" "$kind" "$art_id" "$created" "$head_sha" "$zip" >> "$out/downloads.tsv"
+                  echo "$repo run $run_id $kind: downloaded"
+                else
+                  rm -f "$zip"
+                  skip "$repo" "$run_id" "$kind" download-failed
+                fi
+              done < "$list"
+            done
+          done
+
+          echo "Downloaded $(wc -l < "$out/downloads.tsv") artifact(s), skipped $(wc -l < "$out/skipped.tsv")"
+
+      # - name: Verify artifacts (placeholder)
+      #   run: |
+      #     # TODO: for every zip in work/downloads/downloads.tsv: check the run (finished, an ARMOR run, not
+      #     # uploaded before: the lookback window overlaps the previous run's by about 6 hours, so the same
+      #     # run can arrive twice) and the zip (file types, executables, symlinks, unsafe paths, sizes, JSON,
+      #     # metadata against the run). Ignore an artifact that fails and carry on with the next one; fail
+      #     # the run in a last step if any artifact was ignored or skipped (work/downloads/skipped.tsv).
+      #     # Put what passed under work/verified/<folder>/ and add one line per artifact to
+      #     # work/verified/to_upload.tsv.
+      #     mkdir -p work/verified
+      #     printf '# kind\tfolder\ts3-prefix\n' > work/verified/to_upload.tsv
+      #     echo "TODO: verify the artifacts"
+
+      # - name: Upload to S3
+      #   run: |
+      #     set -uo pipefail
+      #     failed=0
+      #     while IFS=$'\t' read -r kind folder prefix; do
+      #       [[ -z $kind || $kind == \#* ]] && continue
+      #       # Keep these plain relative paths: they must never point outside work/verified.
+      #       if ! [[ $folder =~ ^[A-Za-z0-9._/-]+$ && $prefix =~ ^[A-Za-z0-9._/-]+$ && $folder != *..* && $prefix != *..* ]]; then
+      #         echo "::error::unsafe folder or prefix in to_upload.tsv"
+      #         failed=1
+      #         continue
+      #       fi
+      #       src="work/verified/$folder"
+      #       case $kind in
+      #         api) aws s3 cp "$src" "s3://$S3_BUCKET/$prefix/files" --recursive \
+      #                --content-type application/octet-stream --only-show-errors ;;
+      #         abi) aws s3 cp "$src/abi_metadata.json" "s3://$S3_BUCKET/$prefix/files/abi_metadata.json" \
+      #                --content-type application/json --only-show-errors ;;
+      #         *)   echo "::error::unknown kind in to_upload.tsv"; false ;;
+      #       esac < /dev/null || { echo "::error::upload failed for $folder"; failed=1; }
+      #     done < work/verified/to_upload.tsv
+      #     exit "$failed"

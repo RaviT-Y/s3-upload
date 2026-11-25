@@ -1,0 +1,5 @@
+# Repositories whose ARMOR artifacts (apichecker-reports / abichecker-reports) are published to S3.
+# One repository name per line (the owner is REPO_OWNER in the workflow); '#' starts a comment.
+# Changes go through review on the default branch.
+
+fastrpc
