@@ -76,6 +76,7 @@ jobs:
           LOOKBACK_HOURS: ${{ inputs.lookback-hours || '30' }}
         run: |
           set -uo pipefail
+          verbose=1        # testing: print every detail. Set to 0 for a short log.
           # The run is daily, so the window is longer than 24 hours: a late or skipped schedule must not
           # leave a gap. The overlap means an artifact can show up in two runs (see the verify step).
           lookback_hours="${LOOKBACK_HOURS:-30}"
@@ -90,14 +91,46 @@ jobs:
           : > "$out/downloads.tsv"
           : > "$out/skipped.tsv"
           list="$(mktemp)"
+          raw="$(mktemp)"
 
           # skip <repo> <run_id> <kind> <reason>
           skip() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$out/skipped.tsv"; echo "::warning::$1 run $2 $3 skipped ($4)"; }
+
+          # Testing helpers (used when verbose=1)
+          run_info() {   # what the verify step will need to know about a run
+            gh api "/repos/$1/actions/runs/$2" < /dev/null --jq '"      run: status=\(.status) conclusion=\(.conclusion) event=\(.event) branch=\(.head_branch) attempt=\(.run_attempt) workflow=\(.path) calls=\([.referenced_workflows[]?.path] | join(","))"' 2>&1 \
+              || echo "      run: could not read run $2"
+          }
+          list_zip() {   # the entries of a zip: names are escaped, nothing is extracted
+            command -v python3 > /dev/null || { echo "      (python3 is not installed: cannot list the zip)"; return; }
+            python3 - "$1" <<'PY'
+          import sys, zipfile
+          try:
+              with zipfile.ZipFile(sys.argv[1]) as z:
+                  infos = z.infolist()
+                  print("      zip entries: %d" % len(infos))
+                  for i in infos[:100]:
+                      print("      %10d  %s  %s" % (i.file_size, oct(i.external_attr >> 16), ascii(i.filename)))
+                  if len(infos) > 100:
+                      print("      ... and %d more" % (len(infos) - 100))
+          except Exception as exc:
+              print("      not a readable zip: " + type(exc).__name__)
+          PY
+          }
 
           mapfile -t repos < <(sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' repos.txt | grep -v '^$')
           if (( ${#repos[@]} == 0 )); then
             echo "::error::repos.txt lists no repositories"
             exit 1
+          fi
+
+          if (( verbose )); then
+            echo "== settings"
+            echo "   lookback:   $lookback_hours hours (artifacts created after $cutoff)"
+            echo "   size limit: $max_zip bytes per zip"
+            echo "   runner:     $(uname -sm), $(gh --version | head -1), $(jq --version), $(python3 --version 2>&1)"
+            echo "   rate limit: $(gh api /rate_limit --jq '.resources.core | "\(.remaining) of \(.limit) requests left"' 2>&1)"
+            echo "   repos (${#repos[@]}): ${repos[*]}"
           fi
 
           for repo in "${repos[@]}"; do
@@ -109,20 +142,36 @@ jobs:
             fi
             for name in apichecker-reports abichecker-reports; do
               kind="${name%checker-reports}"                    # api / abi
+              echo "-- $name"
 
               # List: gh api "/repos/<repo>/actions/artifacts?name=<name>"
+              if ! gh api --paginate "/repos/$repo/actions/artifacts?name=$name&per_page=100" > "$raw"; then
+                skip "$repo" - "$kind" listing-failed
+                continue
+              fi
+              if (( verbose )); then
+                echo "   $(jq -s -r '.[0].total_count' "$raw") artifact(s) with this name in the repo; what happens to each (newest first, first 100):"
+                jq -r --arg name "$name" --arg cutoff "$cutoff" '
+                    .artifacts[]
+                    | "     artifact \(.id)  run \(.workflow_run.id)  created \(.created_at)  \(.size_in_bytes) bytes  ->  "
+                      + (if .name != $name then "ignored (other name)" elif .expired then "ignored (expired)"
+                         elif .created_at < $cutoff then "ignored (older than the window)" else "in the window" end)' "$raw" | head -n 100
+              fi
+
               # Keep what is not expired and was created inside the lookback window, newest artifact per run.
-              if ! gh api --paginate "/repos/$repo/actions/artifacts?name=$name&per_page=100" \
-                   | jq -r --arg name "$name" --arg cutoff "$cutoff" '
+              if ! jq -r --arg name "$name" --arg cutoff "$cutoff" '
                        .artifacts[]
                        | select(.name == $name and (.expired | not) and .created_at >= $cutoff)
-                       | [.workflow_run.id, .id, .created_at, (.workflow_run.head_sha // "-"), .size_in_bytes] | @tsv' \
+                       | [.workflow_run.id, .id, .created_at, (.workflow_run.head_sha // "-"), .size_in_bytes] | @tsv' "$raw" \
                    | sort -t $'\t' -k1,1n -k3,3r | awk -F '\t' '!seen[$1]++' > "$list"; then
                 skip "$repo" - "$kind" listing-failed
                 continue
               fi
+              (( verbose )) && echo "   to download (newest per run): $(wc -l < "$list")"
 
               while IFS=$'\t' read -r run_id art_id created head_sha size; do
+                echo "   run $run_id: artifact $art_id, created $created, $size bytes, commit ${head_sha:0:12}"
+                (( verbose )) && run_info "$repo" "$run_id"
                 if ! [[ $run_id =~ ^[0-9]+$ && $art_id =~ ^[0-9]+$ && $size =~ ^[0-9]+$ ]]; then
                   skip "$repo" "$run_id" "$kind" unexpected-data
                   continue
@@ -137,7 +186,11 @@ jobs:
                 mkdir -p "$(dirname "$zip")"
                 if gh api "/repos/$repo/actions/artifacts/$art_id/zip" < /dev/null > "$zip"; then
                   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$repo" "$run_id" "$kind" "$art_id" "$created" "$head_sha" "$zip" >> "$out/downloads.tsv"
-                  echo "$repo run $run_id $kind: downloaded"
+                  echo "      downloaded to $zip"
+                  if (( verbose )); then
+                    echo "      $(stat -c %s "$zip") bytes, sha256 $(sha256sum "$zip" | cut -d' ' -f1)"
+                    list_zip "$zip"
+                  fi
                 else
                   rm -f "$zip"
                   skip "$repo" "$run_id" "$kind" download-failed
@@ -147,6 +200,15 @@ jobs:
           done
 
           echo "Downloaded $(wc -l < "$out/downloads.tsv") artifact(s), skipped $(wc -l < "$out/skipped.tsv")"
+          if (( verbose )); then
+            echo
+            echo "=== downloads.tsv: repo, run_id, kind, artifact_id, created_at, head_sha, zip"
+            cat "$out/downloads.tsv"
+            echo "=== skipped.tsv: repo, run_id, kind, reason"
+            cat "$out/skipped.tsv"
+            echo "=== files on disk"
+            find "$out" -type f -printf '   %8s bytes  %p\n'
+          fi
 
       # - name: Verify artifacts (placeholder)
       #   run: |
