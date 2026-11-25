@@ -38,6 +38,9 @@ fake = os.environ["FAKE"]
 args = sys.argv[1:]
 with open(os.path.join(fake, "aws.log"), "a") as log:
     log.write(" ".join(args) + "\\n")
+with open(os.path.join(fake, "aws.env"), "a") as log:
+    log.write(" ".join("%s=%s" % (name, os.environ.get(name, "<unset>")) for name in (
+        "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_DEFAULT_REGION")) + "\\n")
 store = os.path.join(fake, "bucket")
 def local(url):
     return os.path.join(store, url[len("s3://"):])
@@ -142,7 +145,9 @@ class StepsBase(unittest.TestCase):
             handle.write(step_script(name_start))
         literal = {key: value for key, value in step(name_start).get("env", {}).items() if "${{" not in str(value)}
         environment = dict(os.environ, PATH=self.bin + os.pathsep + os.environ["PATH"], FAKE=self.fake,
-                           GH_TOKEN="x", S3_BUCKET="bucket", **literal, **env)
+                           GH_TOKEN="x", S3_BUCKET="bucket", AWS_ACCESS_KEY_ID="AKIATEST", AWS_SECRET_ACCESS_KEY="secret")
+        environment.update(literal)
+        environment.update(env)
         return subprocess.run(["bash", "-e", script], cwd=self.cwd, env=environment, capture_output=True, text=True)
 
     def run_prepare(self):
@@ -289,6 +294,18 @@ class PrepareTest(StepsBase):
         self.assertIn("   abi s3://bucket/" + PREFIX + "/files/", end)
         self.assertNotIn("101", end.split("=== downloads.tsv")[0])
 
+    def test_server_url_decides_the_host_and_the_expected_project_url(self):
+        self.add_run("qualcomm/fastrpc", 100)
+        self.add_artifact("qualcomm/fastrpc", 100, "api", metadata={"project_url": "https://ghe.example.com/qualcomm/fastrpc"})
+        self.add_artifact("qualcomm/fastrpc", 100, "abi")                         # still says https://github.com/...
+        self.validate_proc = self.run_step("Validate zips", SERVER_URL="https://ghe.example.com")
+        proc = self.run_step("Prepare upload", SERVER_URL="https://ghe.example.com")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.lines("work", "verified", "to_upload.tsv"), [
+            "api\tqualcomm__fastrpc__100/api\t2026/11/20/10/ghe.example.com/qualcomm/fastrpc/42/merge/100"])
+        self.assertEqual(self.skipped(), [["qualcomm/fastrpc", "100", "abi", "metadata-mismatch"]])
+        self.assertIn("does not match the run in: project_url", proc.stdout)
+
     def test_every_s3_destination_is_logged_at_the_end(self):
         self.add_run("qualcomm/fastrpc", 100)
         self.add_artifact("qualcomm/fastrpc", 100, "api")
@@ -418,6 +435,24 @@ class UploadTest(StepsBase):
         self.assertIn("::error::upload failed for qualcomm__fastrpc__100/api", proc.stdout)
         self.assertEqual(self.bucket_files(), sorted(PREFIX_FILES("abi")))
 
+    def aws_env(self):
+        with open(os.path.join(self.fake, "aws.env")) as handle:
+            return handle.read().splitlines()
+
+    def test_the_aws_keys_from_the_secrets_reach_aws(self):
+        self.prepare("abi")
+        self.run_step(self.STEP)
+        self.assertEqual(set(self.aws_env()),
+                         {"AWS_ACCESS_KEY_ID=AKIATEST AWS_SECRET_ACCESS_KEY=secret AWS_DEFAULT_REGION=us-west-2"})
+
+    def test_missing_secrets_stop_the_step_before_any_aws_call(self):
+        self.prepare("api", "abi")
+        for missing in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
+            proc = self.run_step(self.STEP, **{missing: ""})
+            self.assertEqual(proc.returncode, 1, missing)
+            self.assertIn("::error::the secrets AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are not set", proc.stdout)
+        self.assertEqual(self.aws_log(), [])
+
     def test_unsafe_lines_in_to_upload_are_refused(self):
         os.makedirs(os.path.join(self.cwd, "work", "verified"))
         with open(os.path.join(self.cwd, "work", "verified", "to_upload.tsv"), "w") as handle:
@@ -437,6 +472,45 @@ def PREFIX_FILES(kind):
     if kind == "abi":
         return [base + "abi_metadata.json"]
     return [base + "metadata.json", base + "others.txt", base + "hdr/armor_reports/json_reports/api_diff_report_a.json"]
+
+
+class SecretsTest(StepsBase):
+    """The AWS keys must reach the upload step and nothing else."""
+
+    def load(self):
+        with open(WORKFLOW, encoding="utf-8") as handle:
+            text = handle.read()
+        return text, yaml.safe_load(text)
+
+    def test_only_the_upload_step_names_the_aws_secrets(self):
+        text, workflow = self.load()
+        steps = workflow["jobs"]["publish"]["steps"]
+        upload = next(item for item in steps if item["name"] == "Upload to S3")
+        in_upload = [name for name, value in upload["env"].items() if "secrets.AWS" in str(value)]
+        self.assertEqual(sorted(in_upload), ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"])
+        for item in steps:
+            if item is not upload:
+                self.assertNotIn("secrets.AWS", str(item), item["name"])
+        # ... and the word appears nowhere else in the file, not even in a comment or the job's env
+        self.assertEqual(sum("secrets.AWS" in line for line in text.split("\n")), len(in_upload))
+
+    def test_no_job_level_or_workflow_level_aws_settings(self):
+        _, workflow = self.load()
+        self.assertEqual([name for name in workflow["jobs"]["publish"].get("env", {}) if name.startswith("AWS")], [])
+        self.assertEqual([name for name in workflow.get("env", {}) if name.startswith("AWS")], [])
+        for item in workflow["jobs"]["publish"]["steps"]:
+            if item["name"] != "Upload to S3":
+                self.assertEqual([name for name in item.get("env", {}) if name.startswith("AWS")], [], item["name"])
+
+    def test_only_the_upload_step_calls_aws(self):
+        _, workflow = self.load()
+        steps = workflow["jobs"]["publish"]["steps"]
+        self.assertEqual([item["name"] for item in steps if "aws " in item.get("run", "")], ["Upload to S3"])
+
+    def test_the_upload_step_comes_after_prepare_and_before_the_final_check(self):
+        _, workflow = self.load()
+        names = [item["name"] for item in workflow["jobs"]["publish"]["steps"]]
+        self.assertEqual([name.split(" (")[0] for name in names][-3:], ["Prepare upload", "Upload to S3", "Fail the run if any artifact was skipped"])
 
 
 class FinishTest(StepsBase):

@@ -9,6 +9,9 @@ import tempfile
 import unittest
 import zipfile
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
+import check_zips  # noqa: E402
+
 SCRIPT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "check_zips.py")
 ALLOWED = "txt json html"
 
@@ -101,10 +104,10 @@ class CheckZipsTest(unittest.TestCase):
             handle.write("\t".join(["o/r", str(run_id), kind, "1", created, "a" * 40, zip_path]) + "\n")
         return zip_path
 
-    def run_check(self, allowed=ALLOWED):
+    def run_check(self, allowed=ALLOWED, server_url=None):
         open(os.path.join(self.dir, "skipped.tsv"), "a").close()
         proc = subprocess.run([sys.executable, "-I", "-B", SCRIPT, self.dir, allowed], capture_output=True, text=True,
-                              env=dict(os.environ, S3_BUCKET="the-bucket"))
+                              env=dict(os.environ, S3_BUCKET="the-bucket", **({"SERVER_URL": server_url} if server_url else {})))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         with open(os.path.join(self.dir, "downloads.tsv")) as handle:
             kept = [line.split("\t")[1] for line in handle]
@@ -217,6 +220,26 @@ class CheckZipsTest(unittest.TestCase):
         end = output[output.index("=== S3 paths"):]
         self.assertIn("   api s3://the-bucket/2026/11/23/10/github.com/o/r/42/merge/1/files/", end)
         self.assertIn("   abi s3://the-bucket/2027/01/02/03/github.com/o/r/development/2/files/", end)
+
+    def test_host_in_the_path_is_taken_from_server_url_like_the_old_flow(self):
+        # the old step: HOST="$(printf '%s' "$SERVER_URL" | sed -E 's#^[a-zA-Z]+://##; s#/.*$##')"
+        for server_url, host in (("https://github.com", "github.com"), ("https://ghe.example.com", "ghe.example.com"),
+                                 ("http://ghe.example.com/some/path/", "ghe.example.com"), ("HTTPS://Git.Example.com", "Git.Example.com"),
+                                 ("github.com", "github.com")):
+            with self.subTest(server_url):
+                self.setUp()
+                self.add(1, self.metadata_zip({"ref_name": "42/merge"}))
+                self.run_check(server_url=server_url)
+                self.assertEqual([row[7] for row in self.rows()], ["2026/11/20/10/%s/o/r/42/merge/1" % host])
+        self.assertEqual(check_zips.host_of("https://github.com"), "github.com")
+
+    def test_host_that_is_not_a_plain_host_name_skips_everything(self):
+        for server_url in ("https://bad host/", "https://a..b/", "https://ghe.example.com:8443", "https:///x"):
+            with self.subTest(server_url):
+                self.setUp()
+                self.add(1, self.metadata_zip({"ref_name": "42/merge"}))
+                kept, skipped, _ = self.run_check(server_url=server_url)
+                self.assertEqual((kept, skipped), ([], {"1": "unexpected-data"}))
 
     def test_testing_default_ref_when_there_is_no_ref_name(self):
         self.add(1, self.metadata_zip({"pr_number": 42}))

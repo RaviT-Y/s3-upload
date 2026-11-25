@@ -16,8 +16,10 @@ A zip fails when it
   - contains a file that has an allowed name but is really a program, script or archive (first bytes)
 Folders may be nested as deep as you like: every file down there is checked the same way.
 
-The S3 folder of a zip that passed:  <yyyy>/<mm>/<dd>/<hh>/github.com/<repo>/<ref>/<run_id>
+The S3 folder of a zip that passed:  <yyyy>/<mm>/<dd>/<hh>/<host>/<repo>/<ref>/<run_id>
   yyyy/mm/dd/hh   when GitHub created the artifact (created_at)
+  host            from the environment variable SERVER_URL (github.server_url), as the old S3 step took it: the
+                  scheme and everything after the first "/" removed; github.com when SERVER_URL is not set
   ref             "ref_name" in the zip's metadata.json (api) or abi_metadata.json (abi): the old github.ref_name,
                   <pr>/merge for a pull request, the branch name for a push. Plain folder names only.
 A zip without a readable metadata file, or with a ref_name that is not plain folder names, fails too.
@@ -50,6 +52,7 @@ DEFAULT_REF = "ref-name-missing"
 
 CREATED = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):")
 REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+HOST = re.compile(r"[A-Za-z0-9.-]+")
 REF_FOLDERS = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]*(/[A-Za-z0-9_-][A-Za-z0-9._-]*)*")   # ASCII only, no "." or ".." folders
 
 # First bytes of programs, scripts and archives.
@@ -155,10 +158,16 @@ def check(zip_path, allowed, log=lambda text: None):
     return None
 
 
-def s3_prefix(zip_path, repo, run_id, kind, created, log=lambda text: None):
+def host_of(server_url):
+    """The host of a server URL the way the old S3 step took it: sed -E 's#^[a-zA-Z]+://##; s#/.*$##'."""
+    return re.sub(r"/.*$", "", re.sub(r"^[a-zA-Z]+://", "", server_url))
+
+
+def s3_prefix(zip_path, repo, run_id, kind, created, log=lambda text: None, host="github.com"):
     """The S3 folder of a zip that passed check(): (prefix, None), or (None, reason) when it cannot be worked out."""
     when = CREATED.match(created)
-    if not (when and REPO.fullmatch(repo) and re.fullmatch("[0-9]+", run_id) and kind in METADATA_FILE):
+    if not (when and REPO.fullmatch(repo) and re.fullmatch("[0-9]+", run_id) and kind in METADATA_FILE
+            and HOST.fullmatch(host) and ".." not in host):
         return None, "unexpected-data"
     name = METADATA_FILE[kind]
     try:
@@ -181,7 +190,7 @@ def s3_prefix(zip_path, repo, run_id, kind, created, log=lambda text: None):
         log("   no ref_name in %s: using the testing default %r" % (name, ref))
     if not (isinstance(ref, str) and REF_FOLDERS.fullmatch(ref) and ".." not in ref):
         return None, "invalid-ref"
-    return "%s/github.com/%s/%s/%s" % ("/".join(when.groups()), repo, ref, run_id), None
+    return "%s/%s/%s/%s/%s" % ("/".join(when.groups()), host, repo, ref, run_id), None
 
 
 def count_files(zip_path):
@@ -209,6 +218,8 @@ def main(argv):
     log("== settings")
     log("   allowed file types: %s" % ", ".join(sorted(allowed)))
     log("   limits: %d entries per zip, the first %d bytes of every file are inspected" % (MAX_ENTRIES, SNIFF_BYTES))
+    host = host_of(os.environ.get("SERVER_URL", "https://github.com"))
+    log("   host in the S3 path: %s (from SERVER_URL)" % clean(host))
     log("   python: %s" % sys.version.split()[0])
     log("   %s: %d zip(s) to check" % (clean(downloads), len(rows)))
 
@@ -226,7 +237,7 @@ def main(argv):
         verdict = check(zip_path, allowed, log)
         prefix = None
         if verdict is None:
-            prefix, reason = s3_prefix(zip_path, row[0], row[1], row[2], row[4], log)
+            prefix, reason = s3_prefix(zip_path, row[0], row[1], row[2], row[4], log, host)
             if prefix is None:
                 verdict = (reason, "")
         if verdict is None:

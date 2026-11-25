@@ -1,6 +1,6 @@
 # ARMOR S3 upload.
 #
-# One job on the AWS runner. The steps share the machine, so files pass from step to step in work/:
+# One job on a GitHub-hosted runner. The steps share the machine, so files pass from step to step in work/:
 #   1. download   downloads the ARMOR artifacts created in the lookback window (30 hours)
 #   2. validate   keeps only the zips that hold nothing but .txt, .json, .html and .log files, and works out
 #                 the S3 path of each (from the zip's own metadata). It logs all paths at its end.
@@ -9,9 +9,10 @@
 #   4. upload     plain `aws s3 cp`; an artifact that is already in S3 is left alone
 #   5. finish     fails the run if any artifact was skipped, so a skipped artifact is never missed
 #
-# Every step runs where the runner's instance role (the S3 access) is reachable, so the download, validate and
-# prepare steps must treat the zips as untrusted. The runner needs the `gh` CLI, `jq` and `python3`, and the
-# role needs s3:PutObject and s3:ListBucket (to see what is already uploaded) on the bucket.
+# The AWS keys are repository secrets and only the upload step gets them (step-level env): the steps that open
+# the untrusted zips never see them. `gh`, `jq`, `python3` and `aws` are on the GitHub-hosted runners. The keys need
+# s3:PutObject and s3:ListBucket (to see what is already uploaded) on the bucket.
+# Secrets to create: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
 #
 # Work folder (work/):
 #
@@ -24,8 +25,9 @@
 #                             kind <TAB> folder <TAB> s3-prefix
 #       kind       api | abi
 #       folder     where the files to upload are, relative to work/verified
-#       s3-prefix  <yyyy>/<mm>/<dd>/<hh>/github.com/<owner>/<repo>/<ref>/<run_id>
-#                  time = when GitHub created the artifact; repo, run_id = GitHub's own data;
+#       s3-prefix  <yyyy>/<mm>/<dd>/<hh>/<host>/<owner>/<repo>/<ref>/<run_id>
+#                  time = when GitHub created the artifact; host = github.server_url without the scheme (as the
+#                  old S3 step took it, so github.com); repo, run_id = GitHub's own data;
 #                  ref = "ref_name" from the artifact's metadata (the github.ref_name of the PR job: <pr>/merge for a
 #                  pull request, the branch name for a push), checked against the run as far as GitHub can tell
 #                  and allowed to be plain folder names only. Files go to s3://<bucket>/<s3-prefix>/files/...
@@ -59,25 +61,20 @@ concurrency:
 jobs:
   publish:
     name: Download, verify and upload
-    # Only the default branch may run this workflow: the job holds the S3 access.
+    # Only the default branch may run this workflow: the job can read the AWS secrets.
     if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
-    # AWS self-hosted runner: its instance role provides the S3 access.
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
       actions: read
       contents: read
     env:
-      S3_BUCKET: qli-prd-armor-gh-artifacts
+      S3_BUCKET: qli-stg-armor-gh-artifacts
     steps:
       - name: Checkout (for repos.txt)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
-      # Self-hosted runners keep their folders between runs: never reuse an old work folder.
-      - name: Start with an empty work folder
-        run: rm -rf work
 
       - name: Download ARMOR artifacts
         env:
@@ -228,13 +225,15 @@ jobs:
       - name: Validate zips (only txt, json, html and log files) and work out the S3 paths
         env:
           ALLOWED_EXT: "txt json html log"
+          SERVER_URL: ${{ github.server_url }}
         run: python3 -I -B scripts/check_zips.py work/downloads "$ALLOWED_EXT"
 
       # For every valid zip: asks GitHub about the run, checks the zip's metadata against it, unpacks the files
       # that will be uploaded and works out their S3 path. Nothing here uses AWS.
-      - name: Prepare upload (check the runs, unpack, build the S3 paths)
+      - name: Prepare upload (check the runs against GitHub, unpack)
         env:
           GH_TOKEN: ${{ secrets.ARMOR_READ_TOKEN || github.token }}
+          SERVER_URL: ${{ github.server_url }}
         run: |
           set +e -uo pipefail     # the runner starts bash with -e: every failure is handled below instead
           export LC_ALL=C          # [A-Za-z0-9] in the checks below must mean plain ASCII, whatever the runner's locale
@@ -245,6 +244,7 @@ jobs:
           : > "$ver/to_upload.tsv"
           ready=0
           waiting=0
+          server_url="${SERVER_URL:-https://github.com}"
 
           # skip <repo> <run_id> <kind> <reason>
           skip() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$down/skipped.tsv"; echo "::warning::$1 run $2 $3 skipped ($4)"; }
@@ -285,7 +285,7 @@ jobs:
             [[ $kind == abi ]] && meta="$ver/$folder/abi_metadata.json"
             pr_json=null
             [[ $pr =~ ^[0-9]+$ ]] && pr_json=$pr
-            if ! mismatch="$(jq -r --arg url "https://github.com/$repo" --arg event "$event" --argjson pr "$pr_json" --arg branch "$head_branch" '
+            if ! mismatch="$(jq -r --arg url "$server_url/$repo" --arg event "$event" --argjson pr "$pr_json" --arg branch "$head_branch" '
                   def ref_ok:
                     .ref_name == null                                  # TESTING: no ref_name yet, the validate step used its default
                     or ((.ref_name | type) == "string"
@@ -333,11 +333,20 @@ jobs:
 
       # The same artifact always gets the same S3 path, so S3 itself tells whether it was uploaded before:
       # no ledger. metadata.json is uploaded last and is what is looked for, so an interrupted upload is
-      # repeated by the next run. Only here is AWS used.
+      # repeated by the next run. Only here is AWS used, and only this step gets the AWS keys.
+      # Needs the secrets AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (see the top of this file).
       - name: Upload to S3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-west-2        # the bucket's region: not a secret
         run: |
           set +e -uo pipefail     # the runner starts bash with -e: every failure is handled below instead
           export LC_ALL=C          # [A-Za-z0-9] in the checks below must mean plain ASCII, whatever the runner's locale
+          if [[ -z ${AWS_ACCESS_KEY_ID:-} || -z ${AWS_SECRET_ACCESS_KEY:-} ]]; then
+            echo "::error::the secrets AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are not set"
+            exit 1
+          fi
           failed=0
           uploaded=0
           already=0
