@@ -4,4 +4,4 @@
 
 qualcomm/fastrpc
 AudioReach/audioreach-audio-utils
-RaviT-Y/qcom-reusable-workflows
+RaviT-Y/userspace-resource-manager
