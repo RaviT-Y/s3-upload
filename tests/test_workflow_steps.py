@@ -494,6 +494,10 @@ class SecretsTest(StepsBase):
         # ... and the word appears nowhere else in the file, not even in a comment or the job's env
         self.assertEqual(sum("secrets.AWS" in line for line in text.split("\n")), len(in_upload))
 
+    def test_the_job_uses_the_environment_that_holds_the_secrets(self):
+        _, workflow = self.load()
+        self.assertEqual(workflow["jobs"]["publish"]["environment"], "s3")
+
     def test_no_job_level_or_workflow_level_aws_settings(self):
         _, workflow = self.load()
         self.assertEqual([name for name in workflow["jobs"]["publish"].get("env", {}) if name.startswith("AWS")], [])

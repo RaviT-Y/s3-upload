@@ -12,7 +12,9 @@
 # The AWS keys are repository secrets and only the upload step gets them (step-level env): the steps that open
 # the untrusted zips never see them. `gh`, `jq`, `python3` and `aws` are on the GitHub-hosted runners. The keys need
 # s3:PutObject and s3:ListBucket (to see what is already uploaded) on the bucket.
-# Secrets to create: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
+# Secrets to create, in the environment "s3" (Settings > Environments): AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
+# Limit that environment to the default branch (Deployment branches). Do not add required reviewers: the daily
+# scheduled run would then wait for an approval every day.
 #
 # Work folder (work/):
 #
@@ -64,6 +66,7 @@ jobs:
     # Only the default branch may run this workflow: the job can read the AWS secrets.
     if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
     runs-on: ubuntu-latest
+    environment: s3          # where the AWS secrets are kept: without this line the job cannot read them
     timeout-minutes: 90
     permissions:
       actions: read
