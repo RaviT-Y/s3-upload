@@ -58,7 +58,6 @@ jobs:
       contents: read
     env:
       S3_BUCKET: qli-prd-armor-gh-artifacts
-      REPO_OWNER: qualcomm            # the owner of the repos listed in repos.txt
     steps:
       - name: Checkout (for repos.txt)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -101,13 +100,11 @@ jobs:
             exit 1
           fi
 
-          for entry in "${repos[@]}"; do
-            # repos.txt lists bare repo names, owned by REPO_OWNER. An owner/repo line is accepted too.
-            repo="$entry"
-            [[ $repo == */* ]] || repo="$REPO_OWNER/$repo"
+          for repo in "${repos[@]}"; do
             echo "== $repo"
+            # repos.txt lists owner/repo
             if ! [[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ && ${repo#*/} != . && ${repo#*/} != .. ]]; then
-              skip "$entry" - - invalid-repo-name
+              skip "$repo" - - invalid-repo-name
               continue
             fi
             for name in apichecker-reports abichecker-reports; do

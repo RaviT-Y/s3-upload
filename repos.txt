@@ -3,3 +3,4 @@
 # Changes go through review on the default branch.
 
 qualcomm/fastrpc
+AudioReach/audioreach-audio-utils
